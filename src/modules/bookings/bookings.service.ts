@@ -3,12 +3,23 @@ import {
   NotFoundException,
   ForbiddenException,
   BadRequestException,
+  ConflictException,
   Inject,
   forwardRef,
 } from '@nestjs/common';
 import { PrismaService } from '../../prisma/prisma.service';
 import { CreateBookingDto } from './dto/create-booking.dto';
-import { BookingStatus, CalendarEntryKind } from '@prisma/client';
+import { BookingStatus, CalendarEntryKind, Prisma } from '@prisma/client';
+
+// Postgres exclusion-violation code raised by the `booking_no_overlap` constraint.
+// See prisma/migrations/20260523000000_prevent_booking_overlap.
+const PG_EXCLUSION_VIOLATION = '23P01';
+function isBookingOverlapError(e: unknown): boolean {
+  return (
+    e instanceof Prisma.PrismaClientKnownRequestError &&
+    (e.meta as { code?: string } | undefined)?.code === PG_EXCLUSION_VIOLATION
+  );
+}
 import { NotificationsService } from '../notifications/notifications.service';
 import { WebsocketGateway } from '../websocket/websocket.gateway';
 import { ClientsService } from '../clients/clients.service';
@@ -161,50 +172,62 @@ export class BookingsService {
     // Check if business has auto-accept enabled
     const autoAccept = businessService.business.autoAcceptBookings;
 
-    // The requester is the user booking, the provider is the business owner
-    const booking = await this.prisma.booking.create({
-      data: {
-        requesterId: userId,
-        providerId: businessService.business.ownerId,
-        businessServiceId: dto.businessServiceId,
-        employeeId: dto.employeeId,
-        agreedPriceCents,
-        appliedTierWeeks,
-        scheduledAt,
-        scheduledEndAt,
-        ...(autoAccept && { status: BookingStatus.ACCEPTED }),
-        options: selectedOptions.length
-          ? {
-              create: selectedOptions.map((opt) => ({
-                serviceOptionId: opt.id,
-                name: opt.name,
-                priceCents: opt.priceCents,
-              })),
-            }
-          : undefined,
-      },
-      include: {
-        businessService: {
-          include: {
-            business: true,
-          },
+    // The requester is the user booking, the provider is the business owner.
+    // The DB-level `booking_no_overlap` EXCLUDE constraint guarantees that
+    // two concurrent inserts on the same employee/time-range cannot both succeed.
+    let booking;
+    try {
+      booking = await this.prisma.booking.create({
+        data: {
+          requesterId: userId,
+          providerId: businessService.business.ownerId,
+          businessServiceId: dto.businessServiceId,
+          employeeId: dto.employeeId,
+          agreedPriceCents,
+          appliedTierWeeks,
+          scheduledAt,
+          scheduledEndAt,
+          ...(autoAccept && { status: BookingStatus.ACCEPTED }),
+          options: selectedOptions.length
+            ? {
+                create: selectedOptions.map((opt) => ({
+                  serviceOptionId: opt.id,
+                  name: opt.name,
+                  priceCents: opt.priceCents,
+                })),
+              }
+            : undefined,
         },
-        employee: true,
-        requester: {
-          select: {
-            id: true,
-            name: true,
+        include: {
+          businessService: {
+            include: {
+              business: true,
+            },
           },
-        },
-        provider: {
-          select: {
-            id: true,
-            name: true,
+          employee: true,
+          requester: {
+            select: {
+              id: true,
+              name: true,
+            },
           },
+          provider: {
+            select: {
+              id: true,
+              name: true,
+            },
+          },
+          options: true,
         },
-        options: true,
-      },
-    });
+      });
+    } catch (e) {
+      if (isBookingOverlapError(e)) {
+        throw new ConflictException(
+          'Ce créneau vient d\'être réservé. Merci d\'en choisir un autre.',
+        );
+      }
+      throw e;
+    }
 
     if (autoAccept) {
       // Auto-accept: notify the client (same flow as manual accept)

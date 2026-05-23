@@ -121,21 +121,32 @@ export class CalendarService {
 
     await this.assertNoOverlap(dto.employeeId, startAt, endAt, null);
 
-    const block = await this.prisma.booking.create({
-      data: {
-        kind: CalendarEntryKind.BLOCK,
-        status: BookingStatus.ACCEPTED,
-        employeeId: dto.employeeId,
-        providerId: userId,
-        requesterId: userId,
-        businessServiceId: null,
-        scheduledAt: startAt,
-        scheduledEndAt: endAt,
-        blockReason: dto.blockReason,
-        notes: dto.notes,
-      },
-      include: ENTRY_INCLUDE,
-    });
+    let block;
+    try {
+      block = await this.prisma.booking.create({
+        data: {
+          kind: CalendarEntryKind.BLOCK,
+          status: BookingStatus.ACCEPTED,
+          employeeId: dto.employeeId,
+          providerId: userId,
+          requesterId: userId,
+          businessServiceId: null,
+          scheduledAt: startAt,
+          scheduledEndAt: endAt,
+          blockReason: dto.blockReason,
+          notes: dto.notes,
+        },
+        include: ENTRY_INCLUDE,
+      });
+    } catch (e) {
+      if (
+        e instanceof Prisma.PrismaClientKnownRequestError &&
+        (e.meta as { code?: string } | undefined)?.code === '23P01'
+      ) {
+        throw new ConflictException('Conflit horaire pour cet employé');
+      }
+      throw e;
+    }
     this.wsGateway.sendCalendarUpdate(userId);
     await this.invalidateBookingsCache(userId);
     return block;
@@ -189,23 +200,37 @@ export class CalendarService {
       select: { autoAcceptBookings: true },
     });
 
-    const appointment = await this.prisma.booking.create({
-      data: {
-        kind: CalendarEntryKind.APPOINTMENT,
-        status: business?.autoAcceptBookings
-          ? BookingStatus.ACCEPTED
-          : BookingStatus.PENDING,
-        employeeId: dto.employeeId,
-        businessServiceId: dto.businessServiceId,
-        providerId: userId,
-        requesterId,
-        scheduledAt,
-        scheduledEndAt,
-        agreedPriceCents: service.priceCents,
-        notes: dto.notes,
-      },
-      include: ENTRY_INCLUDE,
-    });
+    // Even with assertNoOverlap above, a concurrent insert can sneak between
+    // the check and the create. The DB-level `booking_no_overlap` constraint
+    // is the source of truth — we catch its violation and surface a 409.
+    let appointment;
+    try {
+      appointment = await this.prisma.booking.create({
+        data: {
+          kind: CalendarEntryKind.APPOINTMENT,
+          status: business?.autoAcceptBookings
+            ? BookingStatus.ACCEPTED
+            : BookingStatus.PENDING,
+          employeeId: dto.employeeId,
+          businessServiceId: dto.businessServiceId,
+          providerId: userId,
+          requesterId,
+          scheduledAt,
+          scheduledEndAt,
+          agreedPriceCents: service.priceCents,
+          notes: dto.notes,
+        },
+        include: ENTRY_INCLUDE,
+      });
+    } catch (e) {
+      if (
+        e instanceof Prisma.PrismaClientKnownRequestError &&
+        (e.meta as { code?: string } | undefined)?.code === '23P01'
+      ) {
+        throw new ConflictException('Conflit horaire pour cet employé');
+      }
+      throw e;
+    }
     this.wsGateway.sendCalendarUpdate(userId);
     await this.invalidateBookingsCache(userId, requesterId);
     return appointment;
@@ -261,11 +286,22 @@ export class CalendarService {
       }
     }
 
-    const updated = await this.prisma.booking.update({
-      where: { id: entryId },
-      data: updateData,
-      include: ENTRY_INCLUDE,
-    });
+    let updated;
+    try {
+      updated = await this.prisma.booking.update({
+        where: { id: entryId },
+        data: updateData,
+        include: ENTRY_INCLUDE,
+      });
+    } catch (e) {
+      if (
+        e instanceof Prisma.PrismaClientKnownRequestError &&
+        (e.meta as { code?: string } | undefined)?.code === '23P01'
+      ) {
+        throw new ConflictException('Conflit horaire pour cet employé');
+      }
+      throw e;
+    }
     this.wsGateway.sendCalendarUpdate(userId);
     await this.invalidateBookingsCache(userId, entry.requesterId, entry.providerId);
     return updated;
